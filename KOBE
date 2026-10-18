@@ -1,0 +1,153 @@
+import os, io, hmac, hashlib, secrets, sqlite3, time, calendar
+from datetime import datetime, timedelta
+from functools import wraps
+import requests, qrcode
+from flask import Flask, request, session, redirect, render_template_string, abort, send_file
+
+E = os.environ
+app = Flask(__name__)
+app.secret_key = E["SECRET_KEY"]
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax")
+
+API = f"https://graph.facebook.com/v21.0/{E['PHONE_NUMBER_ID']}/messages"
+
+def db():
+    c = sqlite3.connect(E.get("DB_PATH", "boutique.db")); c.row_factory = sqlite3.Row; return c
+
+with db() as c:
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, phone TEXT, name TEXT, mode TEXT,
+        lat REAL, lng REAL, details TEXT, status TEXT, token TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, phone TEXT, who TEXT, body TEXT, created TEXT);
+    """)
+
+def now(): return datetime.now().strftime("%d/%m/%Y %H:%M")
+
+def get_end():
+    with db() as c:
+        r = c.execute("SELECT v FROM settings WHERE k='paid_until'").fetchone()
+        if r: return r["v"]
+        end = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        c.execute("INSERT INTO settings VALUES('paid_until', ?)", (end,))
+        return end
+
+def active(): return datetime.now().strftime("%Y-%m-%d") <= get_end()
+
+def code_for(month):
+    return month + "-" + hmac.new(E["RECHARGE_SECRET"].encode(), month.encode(), hashlib.sha256).hexdigest()[:10].upper()
+
+def apply_code(code):
+    code = code.strip().upper()
+    try:
+        y, m = int(code[:4]), int(code[5:7])
+        if not 1 <= m <= 12: return False
+    except ValueError:
+        return False
+    if not hmac.compare_digest(code, code_for(code[:7])): return False
+    end = f"{code[:7]}-{calendar.monthrange(y, m)[1]:02d}"
+    if end <= get_end(): return False
+    with db() as c:
+        c.execute("UPDATE settings SET v=? WHERE k='paid_until'", (end,))
+    return True
+
+def send(phone, payload):
+    requests.post(API, headers={"Authorization": f"Bearer {E['WHATSAPP_TOKEN']}"},
+                  json={"messaging_product": "whatsapp", "to": phone, **payload}, timeout=15)
+
+def say(phone, text):
+    send(phone, {"type": "text", "text": {"body": text}})
+    with db() as c:
+        c.execute("INSERT INTO msgs(phone,who,body,created) VALUES(?,?,?,?)", (phone, "bot", text, now()))
+
+VERIFY_TOKEN = E["VERIFY_TOKEN"]
+
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    abort(403)
+
+@app.route("/webhook", methods=["POST"])
+def receive_message():
+    data = request.get_json()
+    try:
+        entry = data["entry"][0]["changes"][0]["value"]
+        if "messages" not in entry:
+            return "ok"
+        msg = entry["messages"][0]
+        phone = msg["from"]
+        name = entry["contacts"][0]["profile"]["name"]
+    except (KeyError, IndexError):
+        return "ok"
+
+    body_text = msg.get("text", {}).get("body", "")
+    with db() as c:
+        c.execute("INSERT INTO msgs(phone,who,body,created) VALUES(?,?,?,?)",
+                   (phone, "client", body_text, now()))
+
+    handle_message(phone, name, msg)
+    return "ok"
+
+def handle_message(phone, name, msg):
+    if not active():
+        say(phone, "Désolé, la boutique est temporairement indisponible. Merci de réessayer plus tard.")
+        return
+
+    msg_type = msg.get("type")
+
+    if msg_type == "location":
+        loc = msg["location"]
+        save_location(phone, loc["latitude"], loc["longitude"])
+        say(phone, "Merci ! Ta localisation a bien été reçue. On prépare ta commande.")
+        return
+
+    text = msg.get("text", {}).get("body", "").strip().lower()
+
+    if text in ("salut", "bonjour", "bonsoir", "hello"):
+        send_menu(phone, name)
+    elif text == "1":
+        start_order(phone, mode="magasin")
+    elif text == "2":
+        start_order(phone, mode="livraison")
+    else:
+        save_order_details(phone, text)
+
+def send_menu(phone, name):
+    say(phone, f"Bonjour {name} 👋 Bienvenue ! Que souhaites-tu faire ?\n"
+               f"1️⃣ Venir au magasin\n"
+               f"2️⃣ Me faire livrer")
+
+def start_order(phone, mode):
+    with db() as c:
+        c.execute("INSERT INTO orders(phone, mode, status, created) VALUES(?,?,?,?)",
+                   (phone, mode, "en_attente_details", now()))
+    if mode == "livraison":
+        say(phone, "Parfait ! Peux-tu m'envoyer ta localisation 📍 pour la livraison ?")
+    else:
+        say(phone, "Très bien ! Dis-moi ce que tu veux commander.")
+
+def get_open_order(phone):
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM orders WHERE phone=? AND status!='validee' "
+            "ORDER BY id DESC LIMIT 1", (phone,)
+        ).fetchone()
+
+def save_location(phone, lat, lng):
+    order = get_open_order(phone)
+    if not order:
+        return
+    with db() as c:
+        c.execute("UPDATE orders SET lat=?, lng=? WHERE id=?", (lat, lng, order["id"]))
+
+def save_order_details(phone, text):
+    order = get_open_order(phone)
+    if not order:
+        say(phone, "Écris d'abord 'bonjour' pour voir le menu 🙂")
+        return
+    with db() as c:
+        c.execute("UPDATE orders SET details=?, status='en_attente_validation' WHERE id=?",
+                   (text, order["id"]))
+    say(phone, "Merci, j'ai bien noté ta commande ! "
+               "La commerçante va la valider très bientôt, tu recevras un message de confirmation.")
